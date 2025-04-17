@@ -1,56 +1,29 @@
 from langgraph.graph import StateGraph, END # type: ignore[import]
-from langchain_groq import ChatGroq  # type: ignore[import]
-from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore[import]
 from langchain_core.runnables import RunnableLambda # type: ignore[import]
+from langchain_core.messages import HumanMessage # type: ignore[import]
 from dotenv import load_dotenv # type: ignore[import]
 from docx import Document
 import os, re, json, base64
 from typing import TypedDict, Optional, Dict, Any, List
 import networkx as nx
 import matplotlib.pyplot as plt
+from utils.llms import groq_llm, gemini_llm, groq_llm_vision  # type: ignore[import]
+
+# Define the state schema
+class GraphState(TypedDict, total=False):
+    file_path: str
+    schema_image_path: Optional[str]
+    srs_text: Optional[str]
+    analysis: Optional[Dict[str, Any]]
+    schema_from_image: Optional[Dict[str, Any]]
+    error: Optional[str]
+    setup_spec: Optional[Dict[str, Any]]
+    output_dir: Optional[str]
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize the Groq LLM
-groq_llm = ChatGroq(
-    model="meta-llama/llama-4-scout-17b-16e-instruct",
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-    api_key = os.getenv("GROQ_API_KEY")
-)
-
-# Initialize the Google GenAI LLM
-gemini_llm = ChatGoogleGenerativeAI(
-    temperature=0,
-    model = "gemini-2.0-flash",
-    max_tokens=None,
-    max_retries=2,
-    api_key=os.getenv("GEMINI_API_KEY")
-)
-
-# Initialize Groq LLM with Llama multimodel
-groq_llm_70b = ChatGroq(
-    model="meta=llama/llama-4-maverick-17b-128e-instruct",
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-    api_key = os.getenv("GROQ_API_KEY")
-)
-
-# Initialize Groq llama Vision model
-groq_llm_vision = ChatGroq(
-    model="llama-3.3-vision",
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-    api_key = os.getenv("GROQ_API_KEY")
-)
-
+# Milestone1: Validate and Read .docx File
 # Validate & Read .docx File
 def validate_and_read_docx(state):
     file_path = state["file_path"]
@@ -59,6 +32,7 @@ def validate_and_read_docx(state):
     try:
         doc = Document(file_path)
         text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        print('SRS Document Validation Done')
         return {"srs_text": text}
     except Exception as e:
         return {"error": f"Failed to read document: {e}"}
@@ -87,6 +61,7 @@ def analyze_srs(state):
         analysis = json.loads(content)
     except Exception as e:
         return {"error": f"Failed to parse analysis: {e}"}
+    print('SRS Analysis Done')
     return {"analysis": analysis}
 
 # Convert image to base64 string
@@ -121,18 +96,61 @@ def analyze_schema_image(state):
         match = re.match(r"```json\n(.*?)\n```", resp.content, re.DOTALL)
         content = match.group(1) if match else resp.content
         extracted_schema = json.loads(content)
+        print('Schema Image Analysis Done')
         return {"schema_from_image": extracted_schema}
     except Exception as e:
         return {"error": f"Vision model failed: {e}"}
+    
 
-# Define the state schema
-class GraphState(TypedDict, total=False):
-    file_path: str
-    schema_image_path: Optional[str]
-    srs_text: Optional[str]
-    analysis: Optional[Dict[str, Any]]
-    schema_from_image: Optional[Dict[str, Any]]
-    error: Optional[str]
+# Milestone 2: Project Setup
+def project_setup(state):
+    output_dir = state.get("output_dir", "generated_project")
+    os.makedirs(output_dir, exist_ok=True)
+
+    prompt = f"""
+        Using this analysis:
+
+        {json.dumps(state["analysis"], indent=2)}
+
+        Create a JSON response defining the FastAPI project folder structure like:
+        - app/api/routes/*.py
+        - app/models/*.py
+        - services/, database.py, main.py, README.md, .env, etc.
+
+        Also return:
+        - dependencies: ["fastapi", "uvicorn", ...]
+        - initial_files: {{ "README.md": "...", ".env": "...", "Dockerfile": "...", ... }}
+        - README.md should include all the project overview, explanation, endpoints and their descriptions, project structure, and how to run the project.
+        - .env should include all the environment variables needed for the project.
+        - Dockerfile should include all the dependencies needed to run the project.
+        - The project should be ready to run with all the dependencies and files needed.
+
+        Just provide the structure in JSON information without any extra information.
+    """
+    resp = groq_llm.invoke([HumanMessage(content=prompt)])
+    match = re.match(r"```json\n(.*?)\n```", resp.content, re.DOTALL)
+    analysis = match.group(1) if match else resp.content
+    spec = json.loads(analysis)
+
+    # Create folders
+    for folder in ["app/api/routes", "app/models", "app/services", "tests"]:
+        folder_path = os.path.join(output_dir, folder)
+        os.makedirs(folder_path, exist_ok=True)
+
+    # Write files
+    for rel_path, content in spec["initial_files"].items():
+        full_path = os.path.join(output_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    # Write requirements.txt
+    requirements_path = os.path.join(output_dir, "requirements.txt")
+    with open(requirements_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(spec["dependencies"]))
+    print('Project Setup Done')
+    return {**state, "setup_spec": spec}
+
 
 # Build LangGraph
 graph = StateGraph(GraphState) 
@@ -141,12 +159,14 @@ graph = StateGraph(GraphState)
 graph.add_node("validate_and_read_docx", RunnableLambda(validate_and_read_docx))
 graph.add_node("analyze_srs", RunnableLambda(analyze_srs))
 graph.add_node("analyze_schema_image", RunnableLambda(analyze_schema_image))
+graph.add_node("project_setup", RunnableLambda(project_setup))
 
 # Define flow
 graph.set_entry_point("validate_and_read_docx")
 graph.add_edge("validate_and_read_docx", "analyze_srs")
 graph.add_edge("analyze_srs", "analyze_schema_image")
-graph.add_edge("analyze_schema_image", END)
+graph.add_edge("analyze_schema_image", "project_setup")
+graph.add_edge("project_setup", END)
 
 # Compile the graph
 backend_graph = graph.compile()
@@ -154,14 +174,17 @@ backend_graph = graph.compile()
 # Execute the Graph
 result = backend_graph.invoke({
     "file_path": "Python Gen AI backend 14th 18th Apr.docx",
-    "schema_image_path": "srs_db_schema_screenshot.png"  # optional path
+    "schema_image_path": "srs_db_schema_screenshot.png",
+    "output_dir": os.getenv("OUTPUT_DIR")
 })
+
 
 # Build NetworkX graph
 G = nx.DiGraph()
 G.add_edge("validate_and_read_docx", "analyze_srs")
 G.add_edge("analyze_srs", "analyze_schema_image")
-G.add_edge("analyze_schema_image", "END")
+G.add_edge("analyze_schema_image", "project_setup")
+G.add_edge("project_setup", "END")
 
 # Plot and save
 plt.figure(figsize=(10, 6))
@@ -174,11 +197,11 @@ nx.draw(
     node_size=2500,
     font_size=10
 )
-plt.title("LangGraph Flow")
+plt.title("LangGraph Flow - SRS Analysis and Project Setup")
 plt.tight_layout()
-plt.savefig("langgraph_flow.png")  # Save the image
+plt.savefig("langgraph_flow_m1_m2.png")  # Save the image
 
-print("Graph saved as 'langgraph_flow.png'")
+print("Graph saved as 'langgraph_flow_m1_m2.png'")
 
 # Output Result
 print(json.dumps(result, indent=2))
