@@ -4,3 +4,6 @@ google-generativeai
 langgraph
 langchain-google-genai
 python-docx
+graphviz
+networkx
+matplotlib
