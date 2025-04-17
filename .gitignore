@@ -172,3 +172,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# docx srs file
+Python Gen AI backend 14th 18th Apr.docx
